@@ -84,6 +84,20 @@ func PathForRootFS(rootFS string, stackPathMap rep.StackPathMap) (string, error)
 	return rootFS, nil
 }
 
+func taskKeyFromTags(tags executor.Tags) (guid string, domain string, err error) {
+	if tags == nil {
+		return "", "", rep.ErrContainerMissingTags
+	}
+
+	guid = tags[rep.ProcessGuidTag]
+	domain = tags[rep.DomainTag]
+
+	if guid == "" || domain == "" {
+		return "", "", rep.ErrContainerMissingTags
+	}
+
+	return
+}
 // State currently does not return tasks or lrp rootfs, because the
 // auctioneer currently does not need them.
 func (a *AuctionCellRep) State() (rep.CellState, error) {
@@ -102,30 +116,39 @@ func (a *AuctionCellRep) State() (rep.CellState, error) {
 		return rep.CellState{}, err
 	}
 
-	lrpContainers, err := a.client.ListContainers(executor.Tags{
-		rep.LifecycleTag: rep.LRPLifecycle,
-	})
+	containers, err := a.client.ListContainers(nil)
 
 	if err != nil {
 		logger.Error("failed-to-fetch-containers", err)
 		return rep.CellState{}, err
 	}
 
+	var taskGuid, taskDomain string
 	var key *models.ActualLRPKey
 	var keyErr error
+	tasks := []rep.Task{}
 	lrps := []rep.LRP{}
-	for i := range lrpContainers {
-		container := &lrpContainers[i]
+	for i := range containers {
+		container := &containers[i]
 		resource := rep.Resource{MemoryMB: int32(container.MemoryMB), DiskMB: int32(container.DiskMB)}
-		key, keyErr = rep.ActualLRPKeyFromTags(container.Tags)
-		if keyErr != nil {
-			logger.Error("failed-to-extract-key", keyErr)
-			continue
+		if container.Tags[rep.LifecycleTag] == rep.TaskLifecycle {
+			taskGuid, taskDomain, keyErr = taskKeyFromTags(container.Tags)
+			if keyErr != nil {
+				logger.Error("failed-to-extract-task key", keyErr)
+				continue
+			}
+			tasks = append(tasks, rep.NewTask(taskGuid, taskDomain, resource))
+		} else {
+			key, keyErr = rep.ActualLRPKeyFromTags(container.Tags)
+			if keyErr != nil {
+				logger.Error("failed-to-extract-key", keyErr)
+				continue
+			}
+			lrps = append(lrps, rep.NewLRP(*key, resource))
 		}
-		lrps = append(lrps, rep.NewLRP(*key, resource))
 	}
 
-	state := rep.NewCellState(a.rootFSProviders, availableResources, totalResources, lrps, nil, a.zone, a.evacuationReporter.Evacuating())
+	state := rep.NewCellState(a.rootFSProviders, availableResources, totalResources, lrps, tasks, a.zone, a.evacuationReporter.Evacuating())
 
 	a.logger.Info("provided", lager.Data{
 		"available-resources": state.AvailableResources,
@@ -257,6 +280,7 @@ func (a *AuctionCellRep) tasksToAllocationRequests(tasks []rep.Task) ([]executor
 		tags := executor.Tags{}
 		tags[rep.LifecycleTag] = rep.TaskLifecycle
 		tags[rep.DomainTag] = task.Domain
+		tags[rep.ProcessGuidTag] = task.TaskGuid
 
 		resource := executor.NewResource(int(task.MemoryMB), int(task.DiskMB), rootFSPath)
 		requests = append(requests, executor.NewAllocationRequest(task.TaskGuid, &resource, tags))
